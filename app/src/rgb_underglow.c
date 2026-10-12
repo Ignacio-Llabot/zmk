@@ -7,10 +7,12 @@
 #include <zephyr/device.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
+#include <zephyr/random/random.h>
 #include <zephyr/settings/settings.h>
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <zephyr/logging/log.h>
 
@@ -23,6 +25,7 @@
 #include <zmk/usb.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
+#include <zmk/events/position_state_changed.h>
 #include <zmk/events/usb_conn_state_changed.h>
 #include <zmk/workqueue.h>
 
@@ -49,6 +52,11 @@ enum rgb_underglow_effect {
     UNDERGLOW_EFFECT_BREATHE,
     UNDERGLOW_EFFECT_SPECTRUM,
     UNDERGLOW_EFFECT_SWIRL,
+    UNDERGLOW_EFFECT_AURORA,
+    UNDERGLOW_EFFECT_EMBERS,
+    UNDERGLOW_EFFECT_COMET,
+    UNDERGLOW_EFFECT_HEARTBEAT,
+    UNDERGLOW_EFFECT_TYPING,
     UNDERGLOW_EFFECT_NUMBER // Used to track number of underglow effects
 };
 
@@ -175,6 +183,220 @@ static void zmk_rgb_underglow_effect_swirl(void) {
     state.animation_step = state.animation_step % HUE_MAX;
 }
 
+#define FX_NO_ZONE 0xFF
+
+/*
+ * LED chain index lit by each key position, used by the typing effect.
+ * Specific to the eyelash_sofle: its per-key LEDs are wired per column, so each
+ * half only has STRIP_NUM_PIXELS addressable zones (6 columns + thumb keys).
+ */
+static const uint8_t fx_key_zone[] = {
+    0, 1, 2, 3, 4, 5, FX_NO_ZONE, 5, 4, 3, 2, 1, 0,
+    0, 1, 2, 3, 4, 5, FX_NO_ZONE, 5, 4, 3, 2, 1, 0,
+    0, 1, 2, 3, 4, 5, FX_NO_ZONE, 5, 4, 3, 2, 1, 0,
+    0, 1, 2, 3, 4, 5, FX_NO_ZONE, 5, 4, 3, 2, 1, 0,
+    FX_NO_ZONE, 2, 3, 4, 6, 6, FX_NO_ZONE, 6, 6, 4, 3, 2,
+};
+
+// Effect scratch state. Kept out of rgb_underglow_state, whose size is checked when loading
+// settings.
+static uint8_t fx_heat[STRIP_NUM_PIXELS];
+static uint8_t fx_spark[STRIP_NUM_PIXELS];
+static uint16_t fx_energy;
+static uint32_t fx_rand_state;
+
+static void fx_reset(void) {
+    memset(fx_heat, 0, sizeof(fx_heat));
+    memset(fx_spark, 0, sizeof(fx_spark));
+    fx_energy = 0;
+}
+
+static int fx_rand(void) {
+    if (fx_rand_state == 0) {
+        // Seeded per device so the two halves of a split don't flicker in unison.
+        fx_rand_state = sys_rand32_get() | 1;
+    }
+
+    fx_rand_state ^= fx_rand_state << 13;
+    fx_rand_state ^= fx_rand_state >> 17;
+    fx_rand_state ^= fx_rand_state << 5;
+
+    return fx_rand_state & 0x7FFFFFFF;
+}
+
+// Triangle wave: 0..100..0 over one period.
+static int fx_tri(int x, int period) {
+    int half = period / 2;
+
+    x %= period;
+
+    return (x < half ? x : period - x) * 100 / half;
+}
+
+// Smoothstep on 0..100.
+static int fx_ease(int t) { return t * t * (300 - 2 * t) / 10000; }
+
+static void zmk_rgb_underglow_effect_aurora(void) {
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        int hue_wave = fx_ease(fx_tri(state.animation_step + i * 360, 3600));
+        int brt_wave = fx_ease(fx_tri(state.animation_step * 3 + i * 500, 3600));
+
+        hsb.h = (state.color.h + hue_wave * 110 / 100) % HUE_MAX;
+        hsb.b = state.color.b * (45 + brt_wave * 55 / 100) / 100;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_min_max(hsb));
+    }
+
+    state.animation_step = (state.animation_step + state.animation_speed * 4) % 3600;
+}
+
+static void zmk_rgb_underglow_effect_embers(void) {
+    uint8_t spread[STRIP_NUM_PIXELS];
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        int cool = fx_rand() % (6 + state.animation_speed * 3);
+        int heat = fx_heat[i] > cool ? fx_heat[i] - cool : 0;
+
+        if (fx_rand() % 100 < 3 + state.animation_speed * 2) {
+            int flare = 35 + fx_rand() % 45;
+
+            heat = MIN(100, heat + flare);
+        }
+        fx_heat[i] = heat;
+
+        hsb.h = heat * 38 / 100;
+        hsb.s = SAT_MAX;
+        hsb.b = state.color.b * (22 + heat * 78 / 100) / 100;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_min_max(hsb));
+    }
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        int left = fx_heat[i > 0 ? i - 1 : i];
+        int right = fx_heat[i < STRIP_NUM_PIXELS - 1 ? i + 1 : i];
+
+        spread[i] = (left + fx_heat[i] * 6 + right) / 8;
+    }
+    memcpy(fx_heat, spread, sizeof(fx_heat));
+}
+
+static void zmk_rgb_underglow_effect_comet(void) {
+    const int length = STRIP_NUM_PIXELS * 100;
+    const int tail = 350;
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        int behind = (state.animation_step - i * 100 + length) % length;
+        int brt = 0;
+
+        if (behind < tail) {
+            brt = (tail - behind) * 100 / tail;
+            brt = brt * brt / 100;
+        } else if (behind > length - 100) {
+            brt = behind - (length - 100);
+        }
+
+        if (brt > 70) {
+            hsb.s = state.color.s * (100 - (brt - 70) * 2) / 100;
+        }
+        hsb.b = state.color.b * brt / 100;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+    }
+
+    state.animation_step = (state.animation_step + state.animation_speed * 8) % length;
+}
+
+// Envelope of one "lub-dub" over a 2000 step cycle, 0..100.
+static int fx_beat(int t) {
+    if (t < 100) {
+        return t;
+    }
+    if (t < 450) {
+        return 100 - (t - 100) * 80 / 350;
+    }
+    if (t < 550) {
+        return 20 + (t - 450) * 50 / 100;
+    }
+    if (t < 1100) {
+        return 70 - (t - 550) * 70 / 550;
+    }
+
+    return 0;
+}
+
+static void zmk_rgb_underglow_effect_heartbeat(void) {
+    const int middle = STRIP_NUM_PIXELS / 2;
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        int distance = abs(i - middle);
+        int beat = fx_beat((state.animation_step + 2000 - distance * 70) % 2000) *
+                   (100 - distance * 14) / 100;
+
+        hsb.h = 350;
+        hsb.s = SAT_MAX - beat * 25 / 100;
+        hsb.b = state.color.b * (6 + beat * 94 / 100) / 100;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+    }
+
+    state.animation_step = (state.animation_step + state.animation_speed * 30) % 2000;
+}
+
+static void zmk_rgb_underglow_effect_typing(void) {
+    int energy = fx_energy;
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        int idle = fx_tri(state.animation_step + i * 150, 1000) * 10 / 100;
+        int base = 12 + idle + energy * 60 / 1000;
+        bool spark = fx_spark[i] > base;
+
+        hsb.h = (state.color.h + energy * 140 / 1000) % HUE_MAX;
+        if (energy > 700) {
+            hsb.s = state.color.s * (100 - (energy - 700) * 40 / 300) / 100;
+        }
+        if (spark) {
+            hsb.s /= 2;
+        }
+        hsb.b = state.color.b * MIN(100, spark ? fx_spark[i] : base) / 100;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+
+        fx_spark[i] = fx_spark[i] > 18 ? fx_spark[i] - 18 : 0;
+    }
+
+    energy -= energy * (state.animation_speed + 1) / 40 + 1;
+    fx_energy = MAX(energy, 0);
+
+    state.animation_step = (state.animation_step + state.animation_speed * 5) % 1000;
+}
+
+static int rgb_underglow_typing_listener(const zmk_event_t *eh) {
+    const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
+
+    if (ev != NULL && ev->state && state.on && state.current_effect == UNDERGLOW_EFFECT_TYPING) {
+        uint8_t zone =
+            ev->position < ARRAY_SIZE(fx_key_zone) ? fx_key_zone[ev->position] : FX_NO_ZONE;
+
+        if (zone >= STRIP_NUM_PIXELS) {
+            zone = fx_rand() % STRIP_NUM_PIXELS;
+        }
+
+        fx_spark[zone] = 100;
+        fx_energy = MIN(1000, fx_energy + 220);
+    }
+
+    // Only observing: the event must keep bubbling or the key press is lost.
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(rgb_underglow_typing, rgb_underglow_typing_listener);
+ZMK_SUBSCRIPTION(rgb_underglow_typing, zmk_position_state_changed);
+
 static void zmk_rgb_underglow_tick(struct k_work *work) {
     switch (state.current_effect) {
     case UNDERGLOW_EFFECT_SOLID:
@@ -188,6 +410,21 @@ static void zmk_rgb_underglow_tick(struct k_work *work) {
         break;
     case UNDERGLOW_EFFECT_SWIRL:
         zmk_rgb_underglow_effect_swirl();
+        break;
+    case UNDERGLOW_EFFECT_AURORA:
+        zmk_rgb_underglow_effect_aurora();
+        break;
+    case UNDERGLOW_EFFECT_EMBERS:
+        zmk_rgb_underglow_effect_embers();
+        break;
+    case UNDERGLOW_EFFECT_COMET:
+        zmk_rgb_underglow_effect_comet();
+        break;
+    case UNDERGLOW_EFFECT_HEARTBEAT:
+        zmk_rgb_underglow_effect_heartbeat();
+        break;
+    case UNDERGLOW_EFFECT_TYPING:
+        zmk_rgb_underglow_effect_typing();
         break;
     }
 
@@ -362,6 +599,7 @@ int zmk_rgb_underglow_select_effect(int effect) {
 
     state.current_effect = effect;
     state.animation_step = 0;
+    fx_reset();
 
     return zmk_rgb_underglow_save_state();
 }
