@@ -188,14 +188,15 @@ static void zmk_rgb_underglow_effect_swirl(void) {
 /*
  * LED chain index lit by each key position, used by the typing effect.
  * Specific to the eyelash_sofle: its per-key LEDs are wired per column, so each
- * half only has STRIP_NUM_PIXELS addressable zones (6 columns + thumb keys).
+ * half only has STRIP_NUM_PIXELS addressable zones. The chain starts at the thumb
+ * keys and runs outwards to the pinky column.
  */
 static const uint8_t fx_key_zone[] = {
-    0, 1, 2, 3, 4, 5, FX_NO_ZONE, 5, 4, 3, 2, 1, 0,
-    0, 1, 2, 3, 4, 5, FX_NO_ZONE, 5, 4, 3, 2, 1, 0,
-    0, 1, 2, 3, 4, 5, FX_NO_ZONE, 5, 4, 3, 2, 1, 0,
-    0, 1, 2, 3, 4, 5, FX_NO_ZONE, 5, 4, 3, 2, 1, 0,
-    FX_NO_ZONE, 2, 3, 4, 6, 6, FX_NO_ZONE, 6, 6, 4, 3, 2,
+    6, 5, 4, 3, 2, 1, FX_NO_ZONE, 1, 2, 3, 4, 5, 6,
+    6, 5, 4, 3, 2, 1, FX_NO_ZONE, 1, 2, 3, 4, 5, 6,
+    6, 5, 4, 3, 2, 1, FX_NO_ZONE, 1, 2, 3, 4, 5, 6,
+    6, 5, 4, 3, 2, 1, FX_NO_ZONE, 1, 2, 3, 4, 5, 6,
+    FX_NO_ZONE, 4, 3, 2, 0, 0, FX_NO_ZONE, 0, 0, 2, 3, 4,
 };
 
 // Effect scratch state. Kept out of rgb_underglow_state, whose size is checked when loading
